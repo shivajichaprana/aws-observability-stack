@@ -1,0 +1,274 @@
+# =============================================================================
+# OpenTelemetry Collector — agent DaemonSet
+#
+# Deploys an OTel Collector pod on every node in the EKS data plane. The
+# agent owns three jobs:
+#
+#   1. Receive OTLP/gRPC and OTLP/HTTP traffic from local workloads on the
+#      same node (the SDKs default to localhost:4317/4318). Forwarding
+#      stays inside the node, which keeps inter-AZ traffic costs flat.
+#   2. Scrape kubelet cAdvisor metrics + node host metrics from the same
+#      node so we always have a baseline of golden signals even without
+#      OTLP-instrumented apps.
+#   3. Remote-write metrics to Amazon Managed Prometheus using SigV4 auth
+#      (the IRSA role provisioned in terraform/otel-irsa.tf), and forward
+#      traces to the gateway Deployment.
+#
+# This DaemonSet uses the Contrib distribution (otel/opentelemetry-collector-
+# contrib) because we depend on the awsxray, prometheusremotewrite,
+# k8sattributes, kubeletstats and tail_sampling components which the upstream
+# core distribution does not bundle.
+# =============================================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    app.kubernetes.io/part-of: aws-observability-stack
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+---
+# ----------------------------------------------------------------------------
+# ServiceAccount — bound to the IRSA role created by terraform/otel-irsa.tf
+# via the eks.amazonaws.com/role-arn annotation that Terraform stamps in
+# during `terraform apply`. Annotation value is templated by Helm/Kustomize
+# in real deployments; we leave a placeholder here so this manifest is
+# directly applicable in a smoke-test environment.
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector-agent
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: aws-observability-stack
+  annotations:
+    # arn:aws:iam::<account>:role/<name-prefix>-<env>-otel-collector — set
+    # by the IRSA module's ServiceAccount-annotation output.
+    eks.amazonaws.com/role-arn: "REPLACE_WITH_IRSA_ROLE_ARN"
+---
+# ----------------------------------------------------------------------------
+# RBAC — k8sattributes processor needs to watch pods/namespaces and
+# kubeletstats receives /metrics from the local kubelet using the SA token.
+# ----------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector-agent
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: aws-observability-stack
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "nodes", "nodes/proxy", "nodes/stats"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "daemonsets", "deployments", "statefulsets"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: [""]
+    resources: ["nodes/metrics"]
+    verbs: ["get"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector-agent
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: aws-observability-stack
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-collector-agent
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector-agent
+    namespace: observability
+---
+# ----------------------------------------------------------------------------
+# DaemonSet — one Collector per node. Privileges are minimised: hostNetwork
+# is OFF (we use NodePort-style hostPort instead), and the only host mount
+# is /var/log if you wire log scraping later.
+# ----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector-agent
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: aws-observability-stack
+    app.kubernetes.io/version: "0.105.0"
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: otel-collector
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/part-of: aws-observability-stack
+      annotations:
+        # Trigger a rolling restart whenever the ConfigMap content hash
+        # changes. Kustomize / Helm typically own this annotation.
+        configmap.aws-observability-stack/checksum: "REPLACE_WITH_CONFIG_CHECKSUM"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8888"
+    spec:
+      serviceAccountName: otel-collector-agent
+      priorityClassName: system-node-critical
+      terminationGracePeriodSeconds: 30
+      hostNetwork: false
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        # Run on every node, including control-plane / GPU / Spot taints.
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.105.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config=/conf/agent.yaml"
+            - "--feature-gates=+pkg.translator.prometheus.NormalizeName"
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              hostPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              hostPort: 4318
+              protocol: TCP
+            - name: health
+              containerPort: 13133
+              protocol: TCP
+            - name: metrics
+              containerPort: 8888
+              protocol: TCP
+            - name: zpages
+              containerPort: 55679
+              protocol: TCP
+          env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: K8S_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: AWS_REGION
+              value: "REPLACE_WITH_AWS_REGION"
+            - name: AMP_REMOTE_WRITE_URL
+              value: "REPLACE_WITH_AMP_REMOTE_WRITE_URL"
+            - name: CLUSTER_NAME
+              value: "REPLACE_WITH_CLUSTER_NAME"
+            - name: CLUSTER_ENV
+              value: "REPLACE_WITH_CLUSTER_ENV"
+            - name: GOMEMLIMIT
+              # Match the memory_limiter check in agent.yaml so the Go
+              # runtime begins GC before the Collector hits its 80 % alarm.
+              value: "640MiB"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "768Mi"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 30
+            failureThreshold: 5
+            initialDelaySeconds: 15
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+            items:
+              - key: agent.yaml
+                path: agent.yaml
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+---
+# ----------------------------------------------------------------------------
+# A headless Service so Prometheus / Grafana Agent / kube-prometheus-stack
+# can scrape the Collector's own /metrics endpoint per pod. NOT a routing
+# entry point for OTLP — workloads should send to localhost:4317 (hostPort).
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector-agent
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: aws-observability-stack
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: agent
+  ports:
+    - name: metrics
+      port: 8888
+      targetPort: metrics
+      protocol: TCP

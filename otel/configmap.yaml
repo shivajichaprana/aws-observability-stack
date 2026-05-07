@@ -1,0 +1,354 @@
+# =============================================================================
+# OpenTelemetry Collector configuration — shared by the agent DaemonSet
+# and the gateway Deployment.
+#
+# Why one ConfigMap?
+#   We split processing pipelines by service name: metrics traffic terminates
+#   on the per-node DaemonSet (cheap, local) while traces traverse the
+#   gateway Deployment (centralised, batched). Both Collectors share the
+#   same upstream config to keep operator mental model simple — they pick
+#   the pipeline that matches their role via the `--config` flag (see
+#   collector-daemonset.yaml and collector-deployment.yaml).
+#
+# Pipelines exposed:
+#   metrics/agent  : OTLP receiver -> memory_limiter -> resource detection ->
+#                    attributes -> batch -> prometheusremotewrite (AMP)
+#   traces/gateway : OTLP receiver -> memory_limiter -> resource detection ->
+#                    attributes -> batch -> awsxray (AWS X-Ray)
+#   traces/agent   : OTLP receiver -> memory_limiter -> batch ->
+#                    OTLP/gRPC -> gateway service (forward only)
+#
+# Resource detection embeds EKS cluster, EC2 instance, and Kubernetes pod
+# attributes so every metric and span carries enough context to slice in
+# Grafana / X-Ray without further enrichment.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/part-of: aws-observability-stack
+    app.kubernetes.io/component: config
+data:
+  # ---------------------------------------------------------------------------
+  # Agent (DaemonSet) configuration. Runs on every node, scrapes local
+  # workloads via OTLP, ships metrics directly to AMP and forwards traces to
+  # the gateway Deployment over OTLP/gRPC.
+  # ---------------------------------------------------------------------------
+  agent.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      pprof:
+        endpoint: 0.0.0.0:1777
+      zpages:
+        endpoint: 0.0.0.0:55679
+      sigv4auth:
+        # AWS SDK picks credentials from the IRSA-projected token. The
+        # service overrides differ between aps and xray, so each exporter
+        # selects the right one inline.
+        region: ${env:AWS_REGION}
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+            max_recv_msg_size_mib: 16
+          http:
+            endpoint: 0.0.0.0:4318
+
+      # Scrape kubelet cAdvisor metrics directly so node-level CPU / memory
+      # / network counters are available even before any workload sends OTLP.
+      hostmetrics:
+        collection_interval: 30s
+        scrapers:
+          cpu:
+          memory:
+          load:
+          filesystem:
+            exclude_mount_points:
+              mount_points: ["/var/lib/kubelet/*", "/dev/*", "/proc/*", "/sys/*"]
+              match_type: regexp
+          network:
+
+      # Pull pod-level metrics from the local kubelet on the same node.
+      kubeletstats:
+        collection_interval: 30s
+        auth_type: serviceAccount
+        endpoint: https://${env:K8S_NODE_NAME}:10250
+        insecure_skip_verify: true
+        metric_groups: [pod, container, node, volume]
+
+    processors:
+      memory_limiter:
+        # Refuse new data when the Collector approaches its memory limit so
+        # backpressure surfaces upstream rather than the pod being OOM-killed.
+        check_interval: 1s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+
+      batch:
+        # 200ms gives enough room to coalesce small writes from busy nodes
+        # without inflating end-to-end latency on the trace path.
+        send_batch_size: 8192
+        send_batch_max_size: 10000
+        timeout: 200ms
+
+      resourcedetection/eks:
+        detectors: [env, eks, ec2, system]
+        timeout: 5s
+        override: false
+
+      # Stamp every signal with cluster, node and namespace so Grafana
+      # template variables can pivot without parsing labels.
+      resource:
+        attributes:
+          - key: deployment.environment
+            value: ${env:CLUSTER_ENV}
+            action: upsert
+          - key: k8s.cluster.name
+            value: ${env:CLUSTER_NAME}
+            action: upsert
+          - key: telemetry.sdk.collector.role
+            value: agent
+            action: upsert
+
+      # Drop high-cardinality labels we never query so AMP's active-series
+      # count stays inside the workspace quota.
+      attributes/strip:
+        actions:
+          - key: pod_template_hash
+            action: delete
+          - key: controller-revision-hash
+            action: delete
+          - key: pod-template-generation
+            action: delete
+
+      # k8sattributes enriches spans / metrics with workload metadata pulled
+      # from the kube-apiserver via the watch API on the same node.
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        filter:
+          node_from_env_var: K8S_NODE_NAME
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.deployment.name
+            - k8s.statefulset.name
+            - k8s.daemonset.name
+            - k8s.cronjob.name
+            - k8s.job.name
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.node.name
+            - k8s.container.name
+          labels:
+            - tag_name: app.label.component
+              key: app.kubernetes.io/component
+              from: pod
+            - tag_name: app.label.name
+              key: app.kubernetes.io/name
+              from: pod
+        pod_association:
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.ip
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.uid
+          - sources:
+              - from: connection
+
+    exporters:
+      prometheusremotewrite/amp:
+        endpoint: ${env:AMP_REMOTE_WRITE_URL}
+        auth:
+          authenticator: sigv4auth
+        # AWS-recommended: AMP rejects writes with samples older than 25h.
+        # Drop stale series rather than retrying forever.
+        resource_to_telemetry_conversion:
+          enabled: true
+        external_labels:
+          cluster: ${env:CLUSTER_NAME}
+          region: ${env:AWS_REGION}
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 5m
+        timeout: 10s
+        sending_queue:
+          enabled: true
+          num_consumers: 4
+          queue_size: 1000
+
+      # Agent forwards all spans to the gateway over plaintext gRPC inside
+      # the cluster. The gateway is the only Collector with X-Ray creds.
+      otlp/gateway:
+        endpoint: otel-gateway.observability.svc.cluster.local:4317
+        tls:
+          insecure: true
+        retry_on_failure:
+          enabled: true
+        sending_queue:
+          enabled: true
+          num_consumers: 4
+          queue_size: 1000
+
+      logging:
+        verbosity: basic
+        sampling_initial: 5
+        sampling_thereafter: 200
+
+    service:
+      extensions: [health_check, pprof, zpages, sigv4auth]
+      telemetry:
+        logs:
+          level: info
+          encoding: json
+        metrics:
+          level: detailed
+          address: 0.0.0.0:8888
+      pipelines:
+        metrics/agent:
+          receivers: [otlp, hostmetrics, kubeletstats]
+          processors:
+            - memory_limiter
+            - resourcedetection/eks
+            - k8sattributes
+            - resource
+            - attributes/strip
+            - batch
+          exporters: [prometheusremotewrite/amp]
+        traces/agent:
+          receivers: [otlp]
+          processors:
+            - memory_limiter
+            - resourcedetection/eks
+            - k8sattributes
+            - resource
+            - batch
+          exporters: [otlp/gateway]
+
+  # ---------------------------------------------------------------------------
+  # Gateway (Deployment) configuration. Runs as a fleet of replicas behind a
+  # Kubernetes service. It receives OTLP from the agent fleet and is the
+  # only component that holds X-Ray write credentials.
+  # ---------------------------------------------------------------------------
+  gateway.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      pprof:
+        endpoint: 0.0.0.0:1777
+      zpages:
+        endpoint: 0.0.0.0:55679
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+            max_recv_msg_size_mib: 32
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+
+      batch/traces:
+        # X-Ray rejects batches > 50 segments / 256kb. Keep the batch tight.
+        send_batch_size: 50
+        send_batch_max_size: 50
+        timeout: 1s
+
+      resourcedetection/eks:
+        detectors: [env, eks, ec2, system]
+        timeout: 5s
+        override: false
+
+      resource/gateway:
+        attributes:
+          - key: telemetry.sdk.collector.role
+            value: gateway
+            action: upsert
+          - key: deployment.environment
+            value: ${env:CLUSTER_ENV}
+            action: upsert
+
+      # Tail-based sampling: keep all errors + slow spans, sample 10 % of the
+      # rest. This is cheap because the gateway already has full traces.
+      tail_sampling:
+        decision_wait: 10s
+        num_traces: 50000
+        expected_new_traces_per_sec: 200
+        policies:
+          - name: errors
+            type: status_code
+            status_code:
+              status_codes: [ERROR]
+          - name: slow
+            type: latency
+            latency:
+              threshold_ms: 1000
+          - name: probabilistic
+            type: probabilistic
+            probabilistic:
+              sampling_percentage: 10
+
+      attributes/redact:
+        # Strip well-known PII / auth headers before they reach X-Ray.
+        actions:
+          - key: http.request.header.authorization
+            action: delete
+          - key: http.request.header.cookie
+            action: delete
+          - key: http.request.header.set_cookie
+            action: delete
+          - key: net.peer.ip
+            action: hash
+
+    exporters:
+      awsxray:
+        region: ${env:AWS_REGION}
+        # When the gateway scales out we want each segment partitioned by the
+        # originating service so X-Ray's service map is correct.
+        index_all_attributes: false
+        indexed_attributes:
+          - k8s.namespace.name
+          - k8s.deployment.name
+          - service.name
+          - deployment.environment
+
+      logging:
+        verbosity: basic
+        sampling_initial: 5
+        sampling_thereafter: 200
+
+    service:
+      extensions: [health_check, pprof, zpages]
+      telemetry:
+        logs:
+          level: info
+          encoding: json
+        metrics:
+          level: detailed
+          address: 0.0.0.0:8888
+      pipelines:
+        traces/gateway:
+          receivers: [otlp]
+          processors:
+            - memory_limiter
+            - resourcedetection/eks
+            - resource/gateway
+            - attributes/redact
+            - tail_sampling
+            - batch/traces
+          exporters: [awsxray]

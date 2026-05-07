@@ -1,0 +1,299 @@
+# =============================================================================
+# OpenTelemetry Collector — gateway Deployment
+#
+# The gateway is the only Collector tier that ships traces to AWS X-Ray.
+# Splitting the trace path out of the agent DaemonSet gives us:
+#
+#   * A single set of credentials with xray:PutTraceSegments — easier IAM.
+#   * Tail-based sampling, which requires the entire trace to be in one
+#     Collector instance. The agent DaemonSet would scatter spans across
+#     nodes and break that invariant.
+#   * Buffered batching tuned for X-Ray's 50-segment limit, isolated from
+#     the high-volume metrics path on the agents.
+#
+# Replicas are spread across AZs by topology spread constraints and behind
+# a ClusterIP service that the agents target via in-cluster DNS.
+# =============================================================================
+---
+# ----------------------------------------------------------------------------
+# ServiceAccount — bound to a different IRSA role from the agent because it
+# carries X-Ray credentials and we want least-privilege per role.
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector-gateway
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: aws-observability-stack
+  annotations:
+    # arn:aws:iam::<account>:role/<name-prefix>-<env>-otel-gateway — see
+    # terraform/otel-irsa.tf, output `gateway_role_arn`.
+    eks.amazonaws.com/role-arn: "REPLACE_WITH_GATEWAY_IRSA_ROLE_ARN"
+---
+# ----------------------------------------------------------------------------
+# Service — agents target `otel-gateway.observability.svc.cluster.local:4317`
+# (see configmap.yaml, exporter `otlp/gateway`). We expose 4318 too so the
+# gateway can be a drop-in OTLP/HTTP target for off-cluster workloads via
+# an internal Network Load Balancer in a follow-on story.
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-gateway
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: aws-observability-stack
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: gateway
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+      protocol: TCP
+    - name: metrics
+      port: 8888
+      targetPort: metrics
+      protocol: TCP
+---
+# ----------------------------------------------------------------------------
+# Deployment — odd replica count by default (3) so a rolling restart with
+# maxUnavailable=1 keeps a quorum servicing traffic.
+# ----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-gateway
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: aws-observability-stack
+    app.kubernetes.io/version: "0.105.0"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: otel-collector
+        app.kubernetes.io/component: gateway
+        app.kubernetes.io/part-of: aws-observability-stack
+      annotations:
+        configmap.aws-observability-stack/checksum: "REPLACE_WITH_CONFIG_CHECKSUM"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8888"
+    spec:
+      serviceAccountName: otel-collector-gateway
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        # Spread replicas across AZs to survive a zonal outage.
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+              app.kubernetes.io/component: gateway
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: otel-collector
+                    app.kubernetes.io/component: gateway
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.105.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config=/conf/gateway.yaml"
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+            - name: health
+              containerPort: 13133
+              protocol: TCP
+            - name: metrics
+              containerPort: 8888
+              protocol: TCP
+            - name: zpages
+              containerPort: 55679
+              protocol: TCP
+          env:
+            - name: K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: AWS_REGION
+              value: "REPLACE_WITH_AWS_REGION"
+            - name: CLUSTER_ENV
+              value: "REPLACE_WITH_CLUSTER_ENV"
+            - name: GOMEMLIMIT
+              value: "1536MiB"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 30
+            failureThreshold: 5
+            initialDelaySeconds: 15
+          startupProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 5
+            failureThreshold: 24
+          lifecycle:
+            preStop:
+              exec:
+                # Give in-flight batches a chance to flush to X-Ray before
+                # SIGTERM. 25 s aligns with terminationGracePeriodSeconds=60
+                # minus a worst-case batch timeout.
+                command: ["/bin/sh", "-c", "sleep 25"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+            items:
+              - key: gateway.yaml
+                path: gateway.yaml
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+---
+# ----------------------------------------------------------------------------
+# PodDisruptionBudget so cluster autoscaler / Karpenter consolidation cannot
+# evict the entire gateway tier in one go.
+# ----------------------------------------------------------------------------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: otel-gateway
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: aws-observability-stack
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+      app.kubernetes.io/component: gateway
+---
+# ----------------------------------------------------------------------------
+# HorizontalPodAutoscaler — scale on Collector self-metric `otelcol_exporter_
+# queue_size` proxied through Prometheus / kube-state-metrics. We use CPU
+# here as a portable fallback that works without metrics-server custom
+# adapters; tighten with a Prom adapter once the AMP-backed adapter is in.
+# ----------------------------------------------------------------------------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: otel-gateway
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: aws-observability-stack
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: otel-gateway
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+      selectPolicy: Max
