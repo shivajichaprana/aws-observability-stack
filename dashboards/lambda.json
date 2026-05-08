@@ -1,0 +1,173 @@
+{
+  "annotations": {
+    "list": [
+      {"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}
+    ]
+  },
+  "description": "Lambda function fleet view: invocations, errors, duration percentiles, throttles, concurrent executions, async event age, init duration. Reads CloudWatch metrics in the AWS/Lambda namespace via the CloudWatch data source. Use as the entry dashboard for serverless workloads.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "liveNow": false,
+  "panels": [
+    {"type": "row", "id": 1, "title": "Function summary", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0}, "panels": []},
+    {
+      "type": "stat", "id": 2, "title": "Invocations (1h)",
+      "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 1},
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "palette-classic"}}},
+      "options": {"colorMode": "value", "graphMode": "area", "reduceOptions": {"calcs": ["sum"]}},
+      "targets": [{"namespace": "AWS/Lambda", "metricName": "Invocations", "statistic": "Sum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "A"}]
+    },
+    {
+      "type": "stat", "id": 3, "title": "Errors (1h)",
+      "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 1},
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 10}]}}},
+      "options": {"colorMode": "value", "graphMode": "area", "reduceOptions": {"calcs": ["sum"]}},
+      "targets": [{"namespace": "AWS/Lambda", "metricName": "Errors", "statistic": "Sum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "A"}]
+    },
+    {
+      "type": "stat", "id": 4, "title": "Throttles (1h)",
+      "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+      "gridPos": {"h": 5, "w": 6, "x": 12, "y": 1},
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 10}]}}},
+      "options": {"colorMode": "value", "graphMode": "area", "reduceOptions": {"calcs": ["sum"]}},
+      "targets": [{"namespace": "AWS/Lambda", "metricName": "Throttles", "statistic": "Sum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "A"}]
+    },
+    {
+      "type": "stat", "id": 5, "title": "Duration p99",
+      "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+      "gridPos": {"h": 5, "w": 6, "x": 18, "y": 1},
+      "fieldConfig": {"defaults": {"unit": "ms", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 500}, {"color": "red", "value": 3000}]}}},
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"namespace": "AWS/Lambda", "metricName": "Duration", "statistic": "p99", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "A"}]
+    },
+    {"type": "row", "id": 10, "title": "Invocation health", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 6}, "panels": []},
+    {
+      "type": "timeseries", "id": 11, "title": "Invocations vs errors",
+      "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 7},
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 10}}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["sum", "max", "lastNotNull"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"namespace": "AWS/Lambda", "metricName": "Invocations", "statistic": "Sum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "A", "alias": "invocations"},
+        {"namespace": "AWS/Lambda", "metricName": "Errors", "statistic": "Sum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "B", "alias": "errors"}
+      ]
+    },
+    {
+      "type": "timeseries", "id": 12, "title": "Error ratio",
+      "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 7},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "custom": {"thresholdsStyle": {"mode": "line"}}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.01}, {"color": "red", "value": 0.05}]}}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"namespace": "AWS/Lambda", "expression": "errors / IF(invocations == 0, 1, invocations)", "refId": "RATIO", "alias": "error ratio", "region": "$region", "metricQueryType": 0, "metricEditorMode": 1, "id": "ratio"}, {"namespace": "AWS/Lambda", "metricName": "Invocations", "statistic": "Sum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "invocations", "hide": true, "id": "invocations"}, {"namespace": "AWS/Lambda", "metricName": "Errors", "statistic": "Sum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "errors", "hide": true, "id": "errors"}]
+    },
+    {"type": "row", "id": 20, "title": "Duration", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 15}, "panels": []},
+    {
+      "type": "timeseries", "id": 21, "title": "Duration percentiles (p50/p95/p99)",
+      "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "fieldConfig": {"defaults": {"unit": "ms"}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"namespace": "AWS/Lambda", "metricName": "Duration", "statistic": "p50", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "A", "alias": "p50"},
+        {"namespace": "AWS/Lambda", "metricName": "Duration", "statistic": "p95", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "B", "alias": "p95"},
+        {"namespace": "AWS/Lambda", "metricName": "Duration", "statistic": "p99", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "C", "alias": "p99"},
+        {"namespace": "AWS/Lambda", "metricName": "Duration", "statistic": "Maximum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "D", "alias": "max"}
+      ]
+    },
+    {
+      "type": "timeseries", "id": 22, "title": "Init duration (cold starts)",
+      "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "fieldConfig": {"defaults": {"unit": "ms"}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"namespace": "AWS/Lambda", "metricName": "InitDuration", "statistic": "p95", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "A", "alias": "p95"},
+        {"namespace": "AWS/Lambda", "metricName": "InitDuration", "statistic": "Maximum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "B", "alias": "max"}
+      ]
+    },
+    {"type": "row", "id": 30, "title": "Concurrency + throttling", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 24}, "panels": []},
+    {
+      "type": "timeseries", "id": 31, "title": "Concurrent executions",
+      "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 25},
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "line", "fillOpacity": 20}}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"namespace": "AWS/Lambda", "metricName": "ConcurrentExecutions", "statistic": "Maximum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "A", "alias": "concurrent"},
+        {"namespace": "AWS/Lambda", "metricName": "ProvisionedConcurrentExecutions", "statistic": "Maximum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "B", "alias": "provisioned"}
+      ]
+    },
+    {
+      "type": "timeseries", "id": 32, "title": "Throttles + provisioned-concurrency invocations",
+      "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 25},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"namespace": "AWS/Lambda", "metricName": "Throttles", "statistic": "Sum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "A", "alias": "throttles"},
+        {"namespace": "AWS/Lambda", "metricName": "ProvisionedConcurrencyInvocations", "statistic": "Sum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "B", "alias": "PC invocations"},
+        {"namespace": "AWS/Lambda", "metricName": "ProvisionedConcurrencySpilloverInvocations", "statistic": "Sum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "C", "alias": "PC spillover"}
+      ]
+    },
+    {"type": "row", "id": 40, "title": "Async + DLQ", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 33}, "panels": []},
+    {
+      "type": "timeseries", "id": 41, "title": "Async event age",
+      "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 34},
+      "fieldConfig": {"defaults": {"unit": "ms"}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"namespace": "AWS/Lambda", "metricName": "AsyncEventAge", "statistic": "Maximum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "A"}]
+    },
+    {
+      "type": "timeseries", "id": 42, "title": "Dead letter errors + iterator age",
+      "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 34},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"namespace": "AWS/Lambda", "metricName": "DeadLetterErrors", "statistic": "Sum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "A", "alias": "DLQ errors"},
+        {"namespace": "AWS/Lambda", "metricName": "IteratorAge", "statistic": "Maximum", "dimensions": {"FunctionName": "$function"}, "region": "$region", "period": "60", "refId": "B", "alias": "iterator age (ms)"}
+      ]
+    },
+    {"type": "row", "id": 50, "title": "Account-wide", "collapsed": true, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 42}, "panels": [
+      {
+        "type": "table", "id": 51, "title": "Top 10 functions by error count (last 1h)",
+        "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 43},
+        "fieldConfig": {"defaults": {"unit": "short"}},
+        "options": {"showHeader": true},
+        "targets": [{"namespace": "AWS/Lambda", "metricName": "Errors", "statistic": "Sum", "dimensions": {"FunctionName": "*"}, "region": "$region", "period": "60", "refId": "A"}]
+      },
+      {
+        "type": "table", "id": 52, "title": "Top 10 functions by duration p95",
+        "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"},
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 43},
+        "fieldConfig": {"defaults": {"unit": "ms"}},
+        "options": {"showHeader": true},
+        "targets": [{"namespace": "AWS/Lambda", "metricName": "Duration", "statistic": "p95", "dimensions": {"FunctionName": "*"}, "region": "$region", "period": "60", "refId": "A"}]
+      }
+    ]}
+  ],
+  "refresh": "1m",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["lambda", "serverless", "aws"],
+  "templating": {
+    "list": [
+      {"name": "DS_CW", "type": "datasource", "query": "cloudwatch", "label": "CloudWatch data source", "current": {"text": "CloudWatch", "value": "CloudWatch"}, "hide": 0},
+      {"name": "region", "type": "query", "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"}, "definition": "regions()", "query": "regions()", "refresh": 1, "includeAll": false, "multi": false, "label": "Region", "current": {"text": "us-east-1", "value": "us-east-1"}},
+      {"name": "function", "type": "query", "datasource": {"type": "cloudwatch", "uid": "${DS_CW}"}, "definition": "dimension_values($region,AWS/Lambda,Invocations,FunctionName)", "query": "dimension_values($region,AWS/Lambda,Invocations,FunctionName)", "refresh": 2, "includeAll": false, "multi": false, "label": "Function"}
+    ]
+  },
+  "time": {"from": "now-3h", "to": "now"},
+  "timepicker": {"refresh_intervals": ["30s", "1m", "5m", "15m", "30m", "1h", "6h", "12h", "1d"]},
+  "timezone": "",
+  "title": "Lambda Functions",
+  "uid": "lambda-functions",
+  "version": 1,
+  "weekStart": ""
+}

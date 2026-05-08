@@ -1,0 +1,193 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Cluster-level health for an EKS cluster: nodes, pods, control-plane, resource pressure. Backed by Amazon Managed Prometheus via the kube-state-metrics, kubelet cAdvisor, and apiserver metrics scraped by the OTel Collector. Use as the entrypoint dashboard during an incident.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {"title": "Workload golden signals", "type": "dashboards", "asDropdown": true, "icon": "external link", "tags": ["workload"]}
+  ],
+  "liveNow": false,
+  "panels": [
+    {"type": "row", "id": 1, "title": "Cluster summary", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0}, "panels": []},
+    {
+      "type": "stat", "id": 2, "title": "Ready nodes",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 1},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}, "unit": "short"}},
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"expr": "sum(kube_node_status_condition{cluster=~\"$cluster\",condition=\"Ready\",status=\"true\"})", "refId": "A", "legendFormat": "Ready"}]
+    },
+    {
+      "type": "stat", "id": 3, "title": "NotReady nodes",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 1},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}, "unit": "short"}},
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"expr": "sum(kube_node_status_condition{cluster=~\"$cluster\",condition=\"Ready\",status!=\"true\"})", "refId": "A", "legendFormat": "NotReady"}]
+    },
+    {
+      "type": "stat", "id": 4, "title": "Running pods",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 1},
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "palette-classic"}}},
+      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"expr": "sum(kube_pod_status_phase{cluster=~\"$cluster\",phase=\"Running\"})", "refId": "A"}]
+    },
+    {
+      "type": "stat", "id": 5, "title": "Pending pods",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 1},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 20}]}, "unit": "short"}},
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"expr": "sum(kube_pod_status_phase{cluster=~\"$cluster\",phase=\"Pending\"})", "refId": "A"}]
+    },
+    {
+      "type": "stat", "id": 6, "title": "Container restarts (15m)",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 1},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 5}]}, "unit": "short"}},
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"expr": "sum(increase(kube_pod_container_status_restarts_total{cluster=~\"$cluster\"}[15m]))", "refId": "A"}]
+    },
+    {
+      "type": "stat", "id": 7, "title": "Namespaces",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 1},
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "palette-classic"}}},
+      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"expr": "count(count by (namespace) (kube_namespace_created{cluster=~\"$cluster\"}))", "refId": "A"}]
+    },
+    {"type": "row", "id": 10, "title": "Resource utilisation", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5}, "panels": []},
+    {
+      "type": "timeseries", "id": 11, "title": "Cluster CPU usage vs allocatable",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "fieldConfig": {"defaults": {"unit": "cores", "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2}}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "lastNotNull", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "sum(rate(node_cpu_seconds_total{cluster=~\"$cluster\",mode!=\"idle\"}[5m]))", "legendFormat": "Used", "refId": "A"},
+        {"expr": "sum(kube_node_status_allocatable{cluster=~\"$cluster\",resource=\"cpu\"})", "legendFormat": "Allocatable", "refId": "B"}
+      ]
+    },
+    {
+      "type": "timeseries", "id": 12, "title": "Cluster memory usage vs allocatable",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+      "fieldConfig": {"defaults": {"unit": "bytes", "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2}}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "lastNotNull", "max"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "sum(node_memory_MemTotal_bytes{cluster=~\"$cluster\"} - node_memory_MemAvailable_bytes{cluster=~\"$cluster\"})", "legendFormat": "Used", "refId": "A"},
+        {"expr": "sum(kube_node_status_allocatable{cluster=~\"$cluster\",resource=\"memory\"})", "legendFormat": "Allocatable", "refId": "B"}
+      ]
+    },
+    {
+      "type": "gauge", "id": 13, "title": "CPU request commitment",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 14},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.7}, {"color": "red", "value": 0.9}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "showThresholdMarkers": true},
+      "targets": [{"expr": "sum(kube_pod_container_resource_requests{cluster=~\"$cluster\",resource=\"cpu\"}) / sum(kube_node_status_allocatable{cluster=~\"$cluster\",resource=\"cpu\"})", "refId": "A"}]
+    },
+    {
+      "type": "gauge", "id": 14, "title": "Memory request commitment",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 14},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.7}, {"color": "red", "value": 0.9}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "showThresholdMarkers": true},
+      "targets": [{"expr": "sum(kube_pod_container_resource_requests{cluster=~\"$cluster\",resource=\"memory\"}) / sum(kube_node_status_allocatable{cluster=~\"$cluster\",resource=\"memory\"})", "refId": "A"}]
+    },
+    {
+      "type": "table", "id": 15, "title": "Top 10 namespaces by CPU usage",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 14},
+      "fieldConfig": {"defaults": {"unit": "cores"}},
+      "options": {"showHeader": true},
+      "targets": [{"expr": "topk(10, sum by (namespace) (rate(container_cpu_usage_seconds_total{cluster=~\"$cluster\",namespace!=\"\",container!=\"\"}[5m])))", "format": "table", "instant": true, "refId": "A"}]
+    },
+    {"type": "row", "id": 20, "title": "Control plane", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 20}, "panels": []},
+    {
+      "type": "timeseries", "id": 21, "title": "API server request rate",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 21},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"expr": "sum by (verb) (rate(apiserver_request_total{cluster=~\"$cluster\"}[5m]))", "legendFormat": "{{verb}}", "refId": "A"}]
+    },
+    {
+      "type": "timeseries", "id": 22, "title": "API server request latency (p50/p95/p99)",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 21},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(apiserver_request_duration_seconds_bucket{cluster=~\"$cluster\",verb!=\"WATCH\"}[5m])))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(apiserver_request_duration_seconds_bucket{cluster=~\"$cluster\",verb!=\"WATCH\"}[5m])))", "legendFormat": "p95", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{cluster=~\"$cluster\",verb!=\"WATCH\"}[5m])))", "legendFormat": "p99", "refId": "C"}
+      ]
+    },
+    {
+      "type": "timeseries", "id": 23, "title": "API server 5xx error rate",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 29},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"expr": "sum by (code) (rate(apiserver_request_total{cluster=~\"$cluster\",code=~\"5..\"}[5m]))", "legendFormat": "{{code}}", "refId": "A"}]
+    },
+    {
+      "type": "timeseries", "id": 24, "title": "etcd request duration p99",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 29},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"expr": "histogram_quantile(0.99, sum by (le, operation) (rate(etcd_request_duration_seconds_bucket{cluster=~\"$cluster\"}[5m])))", "legendFormat": "{{operation}}", "refId": "A"}]
+    },
+    {"type": "row", "id": 30, "title": "Node pressure", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 37}, "panels": []},
+    {
+      "type": "timeseries", "id": 31, "title": "Node CPU saturation (load1 / cores)",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 38},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"expr": "node_load1{cluster=~\"$cluster\"} / on (instance) count by (instance) (node_cpu_seconds_total{cluster=~\"$cluster\",mode=\"idle\"})", "legendFormat": "{{instance}}", "refId": "A"}]
+    },
+    {
+      "type": "timeseries", "id": 32, "title": "Node memory pressure",
+      "datasource": {"type": "prometheus", "uid": "${DS_AMP}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 38},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"expr": "1 - (node_memory_MemAvailable_bytes{cluster=~\"$cluster\"} / node_memory_MemTotal_bytes{cluster=~\"$cluster\"})", "legendFormat": "{{instance}}", "refId": "A"}]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["eks", "kubernetes", "cluster", "platform"],
+  "templating": {
+    "list": [
+      {"name": "DS_AMP", "type": "datasource", "query": "prometheus", "label": "Prometheus data source", "current": {"text": "AMP", "value": "AMP"}, "hide": 0},
+      {"name": "cluster", "type": "query", "datasource": {"type": "prometheus", "uid": "${DS_AMP}"}, "definition": "label_values(kube_node_info, cluster)", "query": {"query": "label_values(kube_node_info, cluster)", "refId": "StandardVariableQuery"}, "refresh": 2, "includeAll": false, "multi": false, "label": "Cluster"}
+    ]
+  },
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {"refresh_intervals": ["10s", "30s", "1m", "5m", "15m", "30m", "1h", "6h", "12h", "1d"]},
+  "timezone": "",
+  "title": "EKS Cluster Overview",
+  "uid": "eks-cluster-overview",
+  "version": 1,
+  "weekStart": ""
+}
