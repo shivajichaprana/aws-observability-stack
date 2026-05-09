@@ -1,0 +1,156 @@
+# =============================================================================
+# alerts/slo-availability.yaml
+#
+# Multi-window, multi-burn-rate SLO alerts for an HTTP availability target of
+# 99.9% over a rolling 30-day window. The pattern is taken from the Google SRE
+# workbook, "Alerting on SLOs", chapter 5: combine fast burn (page now) with
+# slow burn (file a ticket) on multiple windows so the alert fires only when
+# error budget is being consumed at a rate that will exhaust the budget before
+# the next reporting cycle.
+#
+# Required Prometheus recording rules / metrics:
+#   * `http_requests_total{job="<svc>"}`  - request counter labelled by status
+#   * `http_requests_total{job="<svc>",status=~"5.."}` - failed requests
+#
+# These alerts are loaded into Amazon Managed Prometheus (AMP) via the
+# `aws_prometheus_rule_group_namespace` resource declared in
+# `terraform/slo-alerts.tf`. The file is named after AMP's alert manager
+# convention so kubectl-style tools can lint it locally with promtool.
+#
+# Burn-rate thresholds are derived from a 99.9% objective:
+#   - 1h window @ 14.4x  burn -> ~2% budget consumed in 1h  (page)
+#   - 6h window @ 6x     burn -> ~5% budget consumed in 6h  (page)
+#   - 1d window @ 3x     burn -> ~10% budget consumed in 1d (ticket)
+#   - 3d window @ 1x     burn -> ~10% budget consumed in 3d (ticket)
+# =============================================================================
+groups:
+  - name: slo-availability-recording
+    interval: 30s
+    rules:
+      # --- Recording rules: failure ratios over multiple windows. -----------
+      # Pre-computing these keeps the alert expressions cheap and consistent.
+      - record: job:slo_errors:ratio_rate_5m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+            /
+          sum by (job) (rate(http_requests_total[5m]))
+
+      - record: job:slo_errors:ratio_rate_30m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[30m]))
+            /
+          sum by (job) (rate(http_requests_total[30m]))
+
+      - record: job:slo_errors:ratio_rate_1h
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[1h]))
+            /
+          sum by (job) (rate(http_requests_total[1h]))
+
+      - record: job:slo_errors:ratio_rate_6h
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[6h]))
+            /
+          sum by (job) (rate(http_requests_total[6h]))
+
+      - record: job:slo_errors:ratio_rate_1d
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[1d]))
+            /
+          sum by (job) (rate(http_requests_total[1d]))
+
+      - record: job:slo_errors:ratio_rate_3d
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[3d]))
+            /
+          sum by (job) (rate(http_requests_total[3d]))
+
+  - name: slo-availability-alerts
+    interval: 30s
+    rules:
+      # --- FAST BURN (page on-call) ------------------------------------------
+      # If we burn 2% of the 30-day budget in 1h AND 30m, we will exhaust
+      # the budget in <=2 days at this rate. Confirming on a second short
+      # window suppresses single-spike false positives.
+      - alert: SLOAvailabilityFastBurn
+        expr: |
+          (
+            job:slo_errors:ratio_rate_1h  > (14.4 * 0.001)
+          and
+            job:slo_errors:ratio_rate_5m  > (14.4 * 0.001)
+          )
+        labels:
+          severity: critical
+          slo: availability
+          team: platform
+        annotations:
+          summary: "{{ $labels.job }} availability SLO is burning the budget at >14.4x"
+          description: |
+            The 1h error rate for {{ $labels.job }} is {{ $value | humanizePercentage }} and
+            confirmed on the 5m window. At this rate the 30-day error budget will
+            be exhausted in less than two days.
+          runbook_url: "https://runbooks.example.com/slo-availability-fast-burn"
+
+      # --- MEDIUM BURN (page on-call) ----------------------------------------
+      # 5% of the budget over 6h, confirmed on 30m. Slower than fast burn but
+      # still page-worthy: at this rate the budget exhausts within ~6 days.
+      - alert: SLOAvailabilityMediumBurn
+        expr: |
+          (
+            job:slo_errors:ratio_rate_6h  > (6 * 0.001)
+          and
+            job:slo_errors:ratio_rate_30m > (6 * 0.001)
+          )
+        labels:
+          severity: critical
+          slo: availability
+          team: platform
+        annotations:
+          summary: "{{ $labels.job }} availability SLO is burning the budget at >6x"
+          description: |
+            The 6h error rate for {{ $labels.job }} is {{ $value | humanizePercentage }} and
+            confirmed on the 30m window. At this rate the 30-day error budget will
+            be exhausted in roughly five to six days.
+          runbook_url: "https://runbooks.example.com/slo-availability-medium-burn"
+
+      # --- SLOW BURN (ticket) ------------------------------------------------
+      # 10% of the budget over 1d, confirmed over 1h. Not worth waking
+      # someone up for, but should land in the platform team's queue.
+      - alert: SLOAvailabilitySlowBurn
+        expr: |
+          (
+            job:slo_errors:ratio_rate_1d > (3 * 0.001)
+          and
+            job:slo_errors:ratio_rate_1h > (3 * 0.001)
+          )
+        labels:
+          severity: warning
+          slo: availability
+          team: platform
+        annotations:
+          summary: "{{ $labels.job }} availability SLO is burning the budget at >3x"
+          description: |
+            Daily error rate for {{ $labels.job }} is {{ $value | humanizePercentage }}.
+            The 30-day budget will be exhausted within 10 days at this rate.
+          runbook_url: "https://runbooks.example.com/slo-availability-slow-burn"
+
+      # --- TREND (ticket) ----------------------------------------------------
+      # 10% of the budget over 3d. Indicates a slow regression that will not
+      # self-heal. Routes to ticketing rather than paging.
+      - alert: SLOAvailabilityTrend
+        expr: |
+          (
+            job:slo_errors:ratio_rate_3d > (1 * 0.001)
+          and
+            job:slo_errors:ratio_rate_6h > (1 * 0.001)
+          )
+        labels:
+          severity: warning
+          slo: availability
+          team: platform
+        annotations:
+          summary: "{{ $labels.job }} is slowly burning availability budget"
+          description: |
+            3-day error rate is {{ $value | humanizePercentage }}. Expected to
+            consume the full 30-day budget in approximately three weeks.
+          runbook_url: "https://runbooks.example.com/slo-availability-trend"

@@ -1,0 +1,134 @@
+# =============================================================================
+# alerts/slo-latency.yaml
+#
+# Latency SLO: 99% of requests served by `http_requests_*` jobs must complete
+# in under 300ms (p95). Burn-rate alerts mirror the availability file: short
+# windows for paging, longer windows for ticketing. The "good event" for a
+# latency SLO is a request that finishes within the threshold; the "bad
+# event" is anything slower.
+#
+# Required Prometheus metrics:
+#   * `http_request_duration_seconds_bucket{job="<svc>",le="0.3"}`
+#   * `http_request_duration_seconds_bucket{job="<svc>",le="+Inf"}`
+#
+# Histogram buckets must include a bucket with `le="0.3"`. If you use a
+# different threshold, update the recording rules in this file. The error
+# budget is `1 - 0.99 = 0.01` (1% of requests are allowed to exceed 300ms).
+# =============================================================================
+groups:
+  - name: slo-latency-recording
+    interval: 30s
+    rules:
+      # Fraction of requests faster than the latency target across windows.
+      - record: job:slo_latency_fast:ratio_rate_5m
+        expr: |
+          sum by (job) (rate(http_request_duration_seconds_bucket{le="0.3"}[5m]))
+            /
+          sum by (job) (rate(http_request_duration_seconds_bucket{le="+Inf"}[5m]))
+
+      - record: job:slo_latency_fast:ratio_rate_30m
+        expr: |
+          sum by (job) (rate(http_request_duration_seconds_bucket{le="0.3"}[30m]))
+            /
+          sum by (job) (rate(http_request_duration_seconds_bucket{le="+Inf"}[30m]))
+
+      - record: job:slo_latency_fast:ratio_rate_1h
+        expr: |
+          sum by (job) (rate(http_request_duration_seconds_bucket{le="0.3"}[1h]))
+            /
+          sum by (job) (rate(http_request_duration_seconds_bucket{le="+Inf"}[1h]))
+
+      - record: job:slo_latency_fast:ratio_rate_6h
+        expr: |
+          sum by (job) (rate(http_request_duration_seconds_bucket{le="0.3"}[6h]))
+            /
+          sum by (job) (rate(http_request_duration_seconds_bucket{le="+Inf"}[6h]))
+
+      - record: job:slo_latency_fast:ratio_rate_1d
+        expr: |
+          sum by (job) (rate(http_request_duration_seconds_bucket{le="0.3"}[1d]))
+            /
+          sum by (job) (rate(http_request_duration_seconds_bucket{le="+Inf"}[1d]))
+
+      # Companion "slow" ratio (1 - fast). Used directly in alert expressions
+      # so on-call sees the percentage of slow requests rather than the
+      # complement of fast ones.
+      - record: job:slo_latency_slow:ratio_rate_5m
+        expr: 1 - job:slo_latency_fast:ratio_rate_5m
+
+      - record: job:slo_latency_slow:ratio_rate_30m
+        expr: 1 - job:slo_latency_fast:ratio_rate_30m
+
+      - record: job:slo_latency_slow:ratio_rate_1h
+        expr: 1 - job:slo_latency_fast:ratio_rate_1h
+
+      - record: job:slo_latency_slow:ratio_rate_6h
+        expr: 1 - job:slo_latency_fast:ratio_rate_6h
+
+      - record: job:slo_latency_slow:ratio_rate_1d
+        expr: 1 - job:slo_latency_fast:ratio_rate_1d
+
+  - name: slo-latency-alerts
+    interval: 30s
+    rules:
+      # --- FAST BURN (page) -------------------------------------------------
+      # The error budget is 1% of requests. Burning it at 14.4x means more
+      # than 14.4% of requests are slow. Confirm on 5m to suppress single
+      # bursty windows.
+      - alert: SLOLatencyFastBurn
+        expr: |
+          (
+            job:slo_latency_slow:ratio_rate_1h > (14.4 * 0.01)
+          and
+            job:slo_latency_slow:ratio_rate_5m > (14.4 * 0.01)
+          )
+        labels:
+          severity: critical
+          slo: latency
+          team: platform
+        annotations:
+          summary: "{{ $labels.job }} p95 latency SLO burning at >14.4x"
+          description: |
+            More than {{ $value | humanizePercentage }} of requests for {{ $labels.job }}
+            took longer than 300ms over the last hour, confirmed on 5m. The 30-day
+            latency budget will be exhausted within two days at this rate.
+          runbook_url: "https://runbooks.example.com/slo-latency-fast-burn"
+
+      # --- MEDIUM BURN (page) -----------------------------------------------
+      - alert: SLOLatencyMediumBurn
+        expr: |
+          (
+            job:slo_latency_slow:ratio_rate_6h  > (6 * 0.01)
+          and
+            job:slo_latency_slow:ratio_rate_30m > (6 * 0.01)
+          )
+        labels:
+          severity: critical
+          slo: latency
+          team: platform
+        annotations:
+          summary: "{{ $labels.job }} p95 latency SLO burning at >6x"
+          description: |
+            {{ $value | humanizePercentage }} of requests have exceeded 300ms over
+            the last 6h, confirmed on 30m. The 30-day budget will be exhausted
+            within five to six days at this rate.
+          runbook_url: "https://runbooks.example.com/slo-latency-medium-burn"
+
+      # --- SLOW BURN (ticket) -----------------------------------------------
+      - alert: SLOLatencySlowBurn
+        expr: |
+          (
+            job:slo_latency_slow:ratio_rate_1d > (3 * 0.01)
+          and
+            job:slo_latency_slow:ratio_rate_1h > (3 * 0.01)
+          )
+        labels:
+          severity: warning
+          slo: latency
+          team: platform
+        annotations:
+          summary: "{{ $labels.job }} p95 latency SLO burning at >3x"
+          description: |
+            Daily slow-request ratio is {{ $value | humanizePercentage }}; latency
+            budget on track to exhaust within ten days.
+          runbook_url: "https://runbooks.example.com/slo-latency-slow-burn"
