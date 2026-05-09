@@ -1,0 +1,2 @@
+# The Lambda runtime ships with boto3, so this file is intentionally empty.
+# Pin a version explicitly only if a specific feature requires it.
