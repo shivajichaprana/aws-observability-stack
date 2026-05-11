@@ -42,3 +42,30 @@ apply: ## terraform apply (with prompt)
 .PHONY: destroy
 destroy: ## terraform destroy
 	terraform -chdir=$(TF_DIR) destroy -var environment=$(ENV)
+
+# --------------------------------------------------------------------------- #
+# CI helpers                                                                   #
+# --------------------------------------------------------------------------- #
+.PHONY: lint
+lint: ## Run all linters (terraform fmt-check, tflint, checkov, ruff, black --check)
+	terraform fmt -check -recursive $(TF_DIR)
+	tflint --recursive --format compact --chdir $(TF_DIR)
+	checkov --directory $(TF_DIR) --framework terraform --quiet --compact
+	ruff check lambda/ scripts/
+	black --check lambda/ scripts/
+
+.PHONY: promtool
+promtool: ## promtool check rules over alerts/*.yaml
+	@for r in alerts/*.yaml; do echo "--- $$r"; promtool check rules $$r; done
+
+.PHONY: dashboards-check
+dashboards-check: ## Validate dashboard JSON schema + uid uniqueness
+	python3 scripts/validate-dashboards.py
+
+.PHONY: dashboards-import
+dashboards-import: ## Import dashboards via terraform grafana provider
+	terraform -chdir=$(TF_DIR) apply -target=grafana_dashboard -var environment=$(ENV)
+
+.PHONY: ci
+ci: fmt validate lint promtool dashboards-check ## Run the full CI suite locally
+	@echo "all CI checks passed"

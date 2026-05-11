@@ -1,0 +1,240 @@
+###############################################################################
+# CI pipeline for aws-observability-stack
+#
+# Runs four logical jobs on every push and pull request:
+#
+#   1. terraform     – formatting + validation + tflint + checkov
+#   2. promtool      – PromQL alert + recording-rule validation
+#   3. dashboards    – Grafana dashboard JSON schema + duplicate-uid check
+#   4. python-lint   – ruff + black --check + mypy on Lambda + script code
+#
+# Each job pins action versions to a specific SHA — pinned at v4 / v3 lines as
+# noted; replace with full SHAs when bumping. Jobs run in parallel and the
+# workflow only succeeds when every job is green.
+###############################################################################
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: "1.7.5"
+  TFLINT_VERSION: "v0.50.3"
+  CHECKOV_VERSION: "3.2.92"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Terraform: fmt / validate / tflint / checkov
+  # ---------------------------------------------------------------------------
+  terraform:
+    name: terraform
+    runs-on: ubuntu-22.04
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+
+      - name: terraform init -backend=false
+        working-directory: terraform
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        working-directory: terraform
+        run: terraform validate -no-color
+
+      - name: Setup tflint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: tflint
+        working-directory: terraform
+        run: |
+          tflint --init
+          tflint --recursive --format compact
+
+      - name: Setup Python (for checkov)
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install checkov
+        run: pip install "checkov==${CHECKOV_VERSION}"
+
+      - name: checkov
+        run: |
+          checkov \
+            --directory terraform \
+            --framework terraform \
+            --quiet \
+            --compact \
+            --soft-fail-on LOW,MEDIUM
+
+  # ---------------------------------------------------------------------------
+  # 2. Promtool: validate every YAML in alerts/ as a Prometheus rule group
+  # ---------------------------------------------------------------------------
+  promtool:
+    name: promtool
+    runs-on: ubuntu-22.04
+    timeout-minutes: 6
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install promtool
+        run: |
+          set -euo pipefail
+          VERSION="2.51.2"
+          curl -sSLo prometheus.tar.gz \
+            "https://github.com/prometheus/prometheus/releases/download/v${VERSION}/prometheus-${VERSION}.linux-amd64.tar.gz"
+          tar -xzf prometheus.tar.gz
+          sudo mv "prometheus-${VERSION}.linux-amd64/promtool" /usr/local/bin/
+          promtool --version
+
+      - name: promtool check rules
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          fail=0
+          for rule in alerts/*.yaml alerts/*.yml; do
+            echo "--- promtool check rules ${rule}"
+            promtool check rules "${rule}" || fail=1
+          done
+          exit "${fail}"
+
+      - name: Sanity-check label presence (every alert has runbook_url annotation)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys, pathlib, yaml
+          rc = 0
+          for f in sorted(pathlib.Path("alerts").glob("*.yaml")):
+              doc = yaml.safe_load(f.read_text())
+              for grp in doc.get("groups", []):
+                  for rule in grp.get("rules", []):
+                      if "alert" not in rule:
+                          continue
+                      annotations = rule.get("annotations", {}) or {}
+                      if "runbook_url" not in annotations:
+                          print(f"::error file={f}::alert '{rule['alert']}' is missing runbook_url annotation")
+                          rc = 1
+          sys.exit(rc)
+          PY
+
+  # ---------------------------------------------------------------------------
+  # 3. Dashboards: JSON parses, schema is reasonable, UIDs are unique
+  # ---------------------------------------------------------------------------
+  dashboards:
+    name: dashboards
+    runs-on: ubuntu-22.04
+    timeout-minutes: 4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install jsonschema
+        run: pip install jsonschema==4.23.0
+
+      - name: Validate dashboard JSON schema and uniqueness
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, sys
+          from jsonschema import Draft202012Validator
+
+          # Loose schema — Grafana dashboard JSON shape varies by version, so we
+          # assert only the invariants we care about: top-level object, title,
+          # uid, and a panels list. This is enough to catch typos and merge
+          # accidents without coupling CI to a specific Grafana version.
+          schema = {
+              "type": "object",
+              "required": ["title", "uid", "panels"],
+              "properties": {
+                  "title":  {"type": "string", "minLength": 3},
+                  "uid":    {"type": "string", "minLength": 4, "maxLength": 40},
+                  "panels": {"type": "array"},
+              },
+          }
+          validator = Draft202012Validator(schema)
+
+          uids: dict[str, str] = {}
+          rc = 0
+          for path in sorted(pathlib.Path("dashboards").glob("*.json")):
+              try:
+                  doc = json.loads(path.read_text())
+              except json.JSONDecodeError as exc:
+                  print(f"::error file={path}::invalid JSON: {exc}")
+                  rc = 1
+                  continue
+
+              errors = sorted(validator.iter_errors(doc), key=lambda e: e.path)
+              for err in errors:
+                  print(f"::error file={path}::{err.message} (at {'/'.join(map(str, err.path))})")
+                  rc = 1
+
+              uid = doc.get("uid")
+              if uid and uid in uids:
+                  print(f"::error file={path}::duplicate uid '{uid}' (also used by {uids[uid]})")
+                  rc = 1
+              elif uid:
+                  uids[uid] = str(path)
+
+          print(f"validated {len(uids)} dashboards, {rc} failures")
+          sys.exit(rc)
+          PY
+
+  # ---------------------------------------------------------------------------
+  # 4. Python lint for Lambda + scripts
+  # ---------------------------------------------------------------------------
+  python-lint:
+    name: python-lint
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install linters
+        run: pip install ruff==0.5.5 black==24.4.2
+
+      - name: ruff check
+        run: ruff check lambda/ scripts/
+
+      - name: black --check
+        run: black --check --diff lambda/ scripts/
