@@ -1,7 +1,6 @@
 # Contributing
 
-Thanks for your interest in `aws-observability-stack`! This project is part of a
-90-day GitHub streak and is under active development.
+Thanks for your interest in `aws-observability-stack`! This project is under active development — issues and pull requests are welcome.
 
 ## Development workflow
 
